@@ -1,4 +1,4 @@
-# tmake
+# Taskfile
 
 Tannin CI and Make pipelines using [Taskfile](https://taskfile.dev/).
 
@@ -128,7 +128,7 @@ This project includes GitHub Actions workflow files that provide CI/CD capabilit
 
 To use it, just commit your code to the repository. The workflows are triggered on push to the main branch and on pull requests.
 
-## Differences from Dagger-based tmake
+## Differences from Dagger-based Implementation
 
 While the functionality is mostly the same, there are a few differences:
 
@@ -147,4 +147,4 @@ To access private repositories:
 
 ## License
 
-Same as the original tmake project.
+Same as the original project.

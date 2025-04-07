@@ -1,0 +1,103 @@
+name: Taskfile CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Set up Go
+      if: ${{ contains(hashFiles('.tmake.json'), 'go') }}
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24'
+        
+    - name: Set up Python
+      if: ${{ contains(hashFiles('.tmake.json'), 'python') }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Set up Node.js
+      if: ${{ contains(hashFiles('.tmake.json'), 'javascript') }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: '20'
+        
+    - name: Install Task
+      uses: arduino/setup-task@v1
+      with:
+        version: '3.x'
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Configure Docker Buildx
+      uses: docker/setup-buildx-action@v2
+      
+    - name: Install dependencies
+      run: |
+        # Common dependencies
+        sudo apt-get update
+        sudo apt-get install -y jq
+    
+    - name: Cache Go modules
+      if: ${{ contains(hashFiles('.tmake.json'), 'go') }}
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: ${{ runner.os }}-go-
+        
+    - name: Cache pip packages
+      if: ${{ contains(hashFiles('.tmake.json'), 'python') }}
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: ${{ runner.os }}-pip-
+        
+    - name: Cache npm packages
+      if: ${{ contains(hashFiles('.tmake.json'), 'javascript') }}
+      uses: actions/cache@v3
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: ${{ runner.os }}-node-
+        
+    - id: 'auth'
+      name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        token_format: 'access_token'
+        service_account: 'github-actions@tannin-platform.iam.gserviceaccount.com'
+        workload_identity_provider: 'projects/540426196855/locations/global/workloadIdentityPools/github/providers/github'
+        
+    - uses: 'docker/login-action@v3'
+      with:
+        registry: us-docker.pkg.dev
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
+        
+    - name: Setup GitHub authentication
+      run: |
+        git config --global url."https://oauth2:${GITHUB_TOKEN}@github.com/mind-security".insteadOf "https://github.com/mind-security"
+        git config --global url."https://oauth2:${GITHUB_TOKEN}@github.com/tanninio".insteadOf "https://github.com/tanninio"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Run Tasks
+      run: |
+        CI=true task
+      env:
+        BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

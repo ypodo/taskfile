@@ -1,0 +1,529 @@
+version: '3'
+
+# Global variables used across tasks
+vars:
+  OUTPUT_DIR: '{{default .OUTPUT_DIR "build"}}'
+  DOCKERFILE: '{{default .DOCKERFILE "Dockerfile"}}'
+  PROTO_DIR: '{{default .PROTO_DIR "proto"}}'
+  PLATFORMS: '{{default .PLATFORMS "linux/amd64"}}'
+  GO_VERSION: '1.24'
+  CONFIG_FILE: '{{default .CONFIG_FILE ".tmake.json"}}'
+  REGISTRY_URL: '{{default .REGISTRY_URL ""}}'
+  # Determine if we're in CI based on env var
+  IS_CI:
+    sh: if [ -n "$CI" ]; then echo "true"; else echo "false"; fi
+
+# Environment setup including reusing some of tmake's logic
+env:
+  GOPRIVATE: buf.build/gen/go,github.com/tanninio,github.com/mind-security,mind.security
+  CGO_ENABLED: 0
+  GOCACHE: "/tmp/.cache/go-build"
+
+# Task configuration
+tasks:
+  # Default task runs the complete pipeline
+  default:
+    desc: Run the default pipeline (lint, test, then build)
+    cmds:
+      - task: read-config
+      - task: run-tasks
+
+  # Initialize a new project with default config
+  init:
+    desc: Initialize a new project with default .tmake.json configuration
+    cmds:
+      - |
+        cat > .tmake.json << EOF
+        {
+          "language": "go",
+          "tasks": [
+            "test",
+            "lint", 
+            "build"
+          ],
+          "dockerfile": "Dockerfile",
+          "proto_dir": "proto",
+          "platforms": [
+            "amd64"
+          ],
+          "env": null,
+          "services": null
+        }
+        EOF
+    status:
+      - test -f .tmake.json
+
+  # Read and parse the config file
+  read-config:
+    internal: true
+    cmds:
+      - |
+        if [ -f "{{.CONFIG_FILE}}" ]; then
+          echo "Using configuration from {{.CONFIG_FILE}}"
+          # Parse the config to extract variables
+          export LANGUAGE=$(jq -r '.language // "go"' {{.CONFIG_FILE}})
+          export TASKS=$(jq -r '.tasks | join(" ")' {{.CONFIG_FILE}})
+          export DOCKERFILE=$(jq -r '.dockerfile // "Dockerfile"' {{.CONFIG_FILE}})
+          export OUTPUT_DIR=$(jq -r '.output_dir // "build"' {{.CONFIG_FILE}})
+          export PROTO_DIR=$(jq -r '.proto_dir // "proto"' {{.CONFIG_FILE}})
+          export PLATFORMS=$(jq -r '.platforms | join(",")' {{.CONFIG_FILE}})
+          
+          # Store the config values in .task environment for later tasks
+          mkdir -p .task
+          echo "LANGUAGE=$LANGUAGE" > .task/env
+          echo "TASKS=$TASKS" >> .task/env
+          echo "DOCKERFILE=$DOCKERFILE" >> .task/env
+          echo "OUTPUT_DIR=$OUTPUT_DIR" >> .task/env
+          echo "PROTO_DIR=$PROTO_DIR" >> .task/env
+          echo "PLATFORMS=$PLATFORMS" >> .task/env
+        else
+          echo "Config file not found, using defaults"
+          # Set default values
+          mkdir -p .task
+          echo "LANGUAGE=go" > .task/env
+          echo "TASKS=test lint build" >> .task/env
+          echo "DOCKERFILE=Dockerfile" >> .task/env
+          echo "OUTPUT_DIR=build" >> .task/env
+          echo "PROTO_DIR=proto" >> .task/env
+          echo "PLATFORMS=amd64" >> .task/env
+        fi
+
+  # Run all tasks specified in the config
+  run-tasks:
+    internal: true
+    cmds:
+      - |
+        source .task/env
+        for task in $TASKS; do
+          echo "Running task: $task"
+          task $task
+        done
+
+  # Build task
+  build:
+    desc: Build the project
+    deps: [setup-auth]
+    cmds:
+      - task: "build:{{.LANGUAGE}}"
+    vars:
+      LANGUAGE:
+        sh: source .task/env && echo $LANGUAGE || echo "go"
+
+  # Language-specific build tasks
+  build:go:
+    internal: true
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - |
+        source .task/env
+        
+        # Extract build configuration if available
+        TAGS=""
+        GCFLAGS=""
+        BUILD_ARGS=""
+        if [ -f "{{.CONFIG_FILE}}" ]; then
+          if jq -e '.build.tags' {{.CONFIG_FILE}} > /dev/null; then
+            TAGS=$(jq -r '.build.tags | join(",")' {{.CONFIG_FILE}})
+          fi
+          if jq -e '.build.gcflags' {{.CONFIG_FILE}} > /dev/null; then
+            GCFLAGS=$(jq -r '.build.gcflags | join(" ")' {{.CONFIG_FILE}})
+          fi
+          # Handle binaries if specified, otherwise build all
+          if jq -e '.build.binaries' {{.CONFIG_FILE}} > /dev/null; then
+            BINARIES=$(jq -r '.build.binaries | map("./cmd/" + .) | join(" ")' {{.CONFIG_FILE}})
+          else
+            BINARIES="./cmd/..."
+          fi
+        else
+          BINARIES="./cmd/..."
+        fi
+        
+        # Build command with optional flags
+        BUILD_CMD="go build -o $OUTPUT_DIR/ -ldflags \"-s -w\""
+        if [ -n "$TAGS" ]; then
+          BUILD_CMD="$BUILD_CMD -tags $TAGS"
+        fi
+        if [ -n "$GCFLAGS" ]; then
+          BUILD_CMD="$BUILD_CMD -gcflags \"$GCFLAGS\""
+        fi
+        
+        # Execute the build
+        eval "$BUILD_CMD $BINARIES"
+      
+        # If in CI, run push task after successful build
+        if [ "$IS_CI" = "true" ]; then
+          task push
+        fi
+
+  build:python:
+    internal: true
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - |
+        source .task/env
+        # Python build logic (create wheel packages, run setup.py, etc.)
+        python -m pip install build
+        python -m build
+        cp dist/* $OUTPUT_DIR/
+
+  build:javascript:
+    internal: true
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - |
+        source .task/env
+        # JavaScript/Node.js build logic
+        npm ci
+        npm run build
+        cp -r dist/* $OUTPUT_DIR/
+
+  build:docker:
+    internal: true
+    cmds:
+      - |
+        source .task/env
+        
+        # Extract platforms from config
+        IFS=',' read -ra PLATFORM_ARRAY <<< "$PLATFORMS"
+        
+        # Extract build args if available
+        BUILD_ARGS=""
+        if [ -f "{{.CONFIG_FILE}}" ] && jq -e '.build.build_args' {{.CONFIG_FILE}} > /dev/null; then
+          while IFS= read -r line; do
+            BUILD_ARGS="$BUILD_ARGS --build-arg $line"
+          done < <(jq -r '.build.build_args | to_entries | map(.key + "=" + .value) | .[]' {{.CONFIG_FILE}})
+        fi
+        
+        # Build multi-platform Docker image
+        DOCKER_PLATFORMS=""
+        for platform in "${PLATFORM_ARRAY[@]}"; do
+          DOCKER_PLATFORMS="$DOCKER_PLATFORMS --platform linux/$platform"
+        done
+        
+        # Build the Docker image with proper tags
+        SERVICE_NAME=$(basename $(pwd))
+        docker buildx build $DOCKER_PLATFORMS $BUILD_ARGS -t $SERVICE_NAME -f $DOCKERFILE .
+
+  # Test task
+  test:
+    desc: Run tests
+    deps: [setup-auth]
+    cmds:
+      - task: "test:{{.LANGUAGE}}"
+    vars:
+      LANGUAGE:
+        sh: source .task/env && echo $LANGUAGE || echo "go"
+
+  # Language-specific test tasks
+  test:go:
+    internal: true
+    cmds:
+      - |
+        source .task/env
+        # Run Go tests
+        go test ./...
+
+  test:python:
+    internal: true
+    cmds:
+      - |
+        source .task/env
+        # Run Python tests (with pytest)
+        python -m pytest
+
+  test:javascript:
+    internal: true
+    cmds:
+      - |
+        source .task/env
+        # Run JavaScript tests
+        npm test
+
+  test:docker:
+    internal: true
+    cmds:
+      - echo "Docker-specific tests not implemented"
+
+  # Lint task
+  lint:
+    desc: Lint the code
+    deps: [setup-auth]
+    cmds:
+      - task: "lint:{{.LANGUAGE}}"
+    vars:
+      LANGUAGE:
+        sh: source .task/env && echo $LANGUAGE || echo "go"
+
+  # Language-specific lint tasks
+  lint:go:
+    internal: true
+    cmds:
+      - |
+        if ! command -v golangci-lint &> /dev/null; then
+          echo "Installing golangci-lint..."
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        fi
+        
+        # Create default golangci config if not present
+        if [ ! -f ".golangci.yml" ] && [ ! -f ".golangci.yaml" ]; then
+          cat > .golangci.yaml << EOF
+        run:
+          timeout: 5m
+        linters:
+          enable:
+            - gofmt
+            - goimports
+            - govet
+            - staticcheck
+            - unused
+        EOF
+        fi
+        
+        # Run the linter
+        golangci-lint run --timeout 10m
+
+  lint:python:
+    internal: true
+    cmds:
+      - |
+        # Install linters if not available
+        pip install flake8 black isort
+        # Run linters
+        flake8 .
+        black --check .
+        isort --check .
+
+  lint:javascript:
+    internal: true
+    cmds:
+      - |
+        # Run JavaScript linter (ESLint)
+        npm run lint
+
+  lint:docker:
+    internal: true
+    cmds:
+      - |
+        # Run Dockerfile linting with hadolint
+        if ! command -v hadolint &> /dev/null; then
+          echo "Installing hadolint..."
+          curl -sSL https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-$(uname -s)-$(uname -m) -o /tmp/hadolint
+          chmod +x /tmp/hadolint
+          sudo mv /tmp/hadolint /usr/local/bin/
+        fi
+        hadolint $DOCKERFILE
+
+  # Push task - pushes built artifacts to registry
+  push:
+    desc: Push built artifacts to registry
+    deps: [build]
+    cmds:
+      - |
+        source .task/env
+        
+        # Handle different languages
+        if [ "$LANGUAGE" = "docker" ] || [ "$IS_CI" = "true" ]; then
+          # Get service name (repository name)
+          SERVICE_NAME=$(basename $(pwd))
+          
+          # Read registry URL from config, env var, or default
+          if [ -f "{{.CONFIG_FILE}}" ] && jq -e '.registry_url' {{.CONFIG_FILE}} > /dev/null; then
+            REGISTRY_URLS=$(jq -r '.registry_url | if type == "array" then .[] else . end' {{.CONFIG_FILE}})
+          elif [ -n "$REGISTRY_URL" ]; then
+            REGISTRY_URLS=$REGISTRY_URL
+          else
+            # Default registry URL, can be customized
+            REGISTRY_URLS="us-docker.pkg.dev/tannin-platform/$SERVICE_NAME"
+          fi
+          
+          # Push to all registry URLs
+          for url in $REGISTRY_URLS; do
+            echo "Pushing to $url"
+            docker tag $SERVICE_NAME $url
+            docker push $url
+            echo "Successfully pushed to $url"
+          done
+        else
+          echo "Push only supported for Docker images or in CI environment"
+        fi
+
+  # Proto/buf task - for managing Protocol Buffers
+  proto:
+    desc: Run Protocol Buffer compilation
+    cmds:
+      - |
+        source .task/env
+        
+        # Ensure buf is installed
+        if ! command -v buf &> /dev/null; then
+          echo "Installing buf..."
+          go install github.com/bufbuild/buf/cmd/buf@latest
+        fi
+        
+        # Run buf generate in the proto directory
+        if [ -d "$PROTO_DIR" ]; then
+          cd $PROTO_DIR && buf generate
+        else
+          echo "Proto directory $PROTO_DIR not found"
+          exit 1
+        fi
+
+  # Migrate task - run database migrations
+  migrate:
+    desc: Run database migrations
+    cmds:
+      - |
+        source .task/env
+        
+        # Detect migration tool - could be golang-migrate, goose, etc.
+        if [ -d "migrate" ]; then
+          echo "Running migrations from migrate directory"
+          # This logic would need to be customized based on your migration system
+          if command -v migrate &> /dev/null; then
+            # Get database URL from config or env
+            DB_URL=${DB_URL:-"postgres://localhost:5432/app?sslmode=disable"}
+            migrate -path ./migrate -database "$DB_URL" up
+          elif [ -f "migrate/main.go" ]; then
+            go run ./migrate
+          else
+            echo "No migration system detected"
+            exit 1
+          fi
+        else
+          echo "No migrations directory found"
+        fi
+
+  # Dev task - setup development environment
+  dev:
+    desc: Set up development environment
+    cmds:
+      - |
+        source .task/env
+        
+        # Language-specific dev environment setup
+        case "$LANGUAGE" in
+          go)
+            # Install go tools
+            go install golang.org/x/tools/cmd/goimports@latest
+            go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+            go install github.com/bufbuild/buf/cmd/buf@latest
+            ;;
+          python)
+            # Set up Python virtualenv
+            python -m venv .venv
+            source .venv/bin/activate
+            pip install -r requirements.txt
+            pip install -r requirements-dev.txt
+            ;;
+          javascript)
+            # Install JS dependencies
+            npm install
+            ;;
+        esac
+        
+        # Set up git hooks if available
+        if [ -d ".github/hooks" ]; then
+          cp .github/hooks/* .git/hooks/
+          chmod +x .git/hooks/*
+        fi
+
+  # Clean task - clean up build artifacts
+  clean:
+    desc: Clean up build artifacts
+    cmds:
+      - |
+        source .task/env
+        
+        # Remove build directory
+        rm -rf $OUTPUT_DIR
+        
+        # Language-specific cleanup
+        case "$LANGUAGE" in
+          go)
+            go clean -cache -testcache
+            ;;
+          python)
+            rm -rf *.egg-info dist build .pytest_cache __pycache__ .coverage
+            find . -name "__pycache__" -type d -exec rm -rf {} +
+            find . -name "*.pyc" -delete
+            ;;
+          javascript)
+            rm -rf node_modules dist coverage
+            ;;
+        esac
+
+  # PR task - create or update a pull request
+  pr:
+    desc: Create or update a pull request
+    cmds:
+      - |
+        # Ensure gh CLI is installed
+        if ! command -v gh &> /dev/null; then
+          echo "GitHub CLI not found. Please install it: https://cli.github.com/"
+          exit 1
+        fi
+        
+        # Get current branch
+        BRANCH=$(git branch --show-current)
+        
+        # Check if PR already exists
+        PR_EXISTS=$(gh pr list --head $BRANCH --json number --jq 'length')
+        
+        if [ "$PR_EXISTS" -gt 0 ]; then
+          echo "Updating existing PR for branch $BRANCH"
+          gh pr edit --head $BRANCH
+        else
+          echo "Creating new PR for branch $BRANCH"
+          # Get branch description from commit messages
+          TITLE=$(git log -1 --pretty=%s)
+          BODY=$(git log -1 --pretty=%b)
+          
+          gh pr create --title "$TITLE" --body "$BODY"
+        fi
+
+  # Auth setup task
+  setup-auth:
+    internal: true
+    cmds:
+      - |
+        # Set up GitHub authentication for private repos
+        if [ -n "$GITHUB_TOKEN" ]; then
+          git config --global url."https://oauth2:${GITHUB_TOKEN}@github.com/mind-security".insteadOf "https://github.com/mind-security"
+          git config --global url."https://oauth2:${GITHUB_TOKEN}@github.com/tanninio".insteadOf "https://github.com/tanninio"
+        elif [ -S "$SSH_AUTH_SOCK" ]; then
+          # SSH agent is running, should have keys loaded
+          echo "Using SSH agent for authentication"
+        else
+          echo "Warning: No GitHub authentication configured. Private repos may not be accessible."
+        fi
+        
+        # Set up .netrc file for Buf.build if needed
+        if [ -f "$HOME/.netrc" ] && grep -q "buf.build" "$HOME/.netrc"; then
+          echo "Using existing .netrc for Buf authentication"
+        elif [ -n "$BUF_TOKEN" ]; then
+          echo "machine buf.build login $BUF_TOKEN password " >> "$HOME/.netrc"
+          chmod 600 "$HOME/.netrc"
+        fi
+
+  # Seed task - seed databases or test data
+  seed:
+    desc: Seed databases or test data
+    cmds:
+      - |
+        source .task/env
+        
+        # Handle different seeding strategies based on project
+        if [ -d "seed" ]; then
+          echo "Running seed scripts from seed directory"
+          # This would be customized for your seeding system
+          if [ -f "seed/main.go" ]; then
+            go run ./seed
+          elif [ -f "seed/seed.sql" ]; then
+            # Get database URL from config or env
+            DB_URL=${DB_URL:-"postgres://localhost:5432/app?sslmode=disable"}
+            # Use psql, mysql, etc. based on DB type
+            psql "$DB_URL" -f seed/seed.sql
+          fi
+        else
+          echo "No seed directory found"
+        fi

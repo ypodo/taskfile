@@ -1,0 +1,15 @@
+{
+  "language": "go",
+  "tasks": [
+    "test",
+    "lint",
+    "build"
+  ],
+  "dockerfile": "Dockerfile",
+  "proto_dir": "proto",
+  "platforms": [
+    "amd64"
+  ],
+  "env": null,
+  "services": null
+}
